@@ -407,20 +407,14 @@ The tests run fully offline. All third-party HTTP calls are mocked with `respx`.
 
 ## Screenshots
 
-### Swagger UI
+### 1. Swagger UI Documentation (`/docs`)
 ![Swagger UI](screenshots/swagger-ui.png)
 
-### Successful posting response
+### 2. Successful Multi-Platform Posting Response (`200 OK`)
 ![Successful response](screenshots/success-response.png)
 
-### Validation error (HTTP 422)
+### 3. Input Validation Shield (`422 Unprocessable Entity`)
 ![Validation error](screenshots/validation-error.png)
-
-### Partial failure (one platform fails, others succeed)
-![Partial failure](screenshots/partial-failure.png)
-
-### Test results
-![Tests passing](screenshots/pytest.png)
 
 ---
 
