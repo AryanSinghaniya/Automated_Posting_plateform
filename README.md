@@ -1,266 +1,279 @@
-# Python Practical Test – Automated Multi-Platform Posting System
+# Automated Multi-Platform Posting API
 
-| Details | Information |
-|---|---|
-| **Project** | Automated Multi-Platform Posting System |
-| **Technology** | Python 3.12+, FastAPI, Uvicorn, Pydantic v2, HTTPX (async), pytest, respx |
-| **Endpoint** | `POST http://localhost:4000/posting` |
-| **Platforms Integrated** | 6 Verified Working Platforms (Telegram, Mastodon, Bluesky, GitHub Gist, Paste.ee, ntfy.sh) |
-| **Evaluation Alignment** | 100 / 100 Marks |
-| **Submission Target** | Public GitHub Repository |
+A FastAPI service that takes one short message containing a call-to-action (CTA) link and publishes it to six third-party platforms at the same time through their official APIs. If one platform fails, the others still post, and the response reports the result for each platform.
+
+**Stack:** Python 3.11+, FastAPI, Uvicorn, Pydantic v2, pydantic-settings, HTTPX (async), pytest, respx
 
 ---
 
-## 1. Project Overview
+## Table of Contents
 
-A high-performance, asynchronous REST API developed with **FastAPI** that automatically publishes a short message containing exactly one call-to-action (CTA) link concurrently across **six reliable third-party platforms** through their official REST APIs:
-
-1. ✈️ **Telegram** – Instant messaging channel broadcast via Telegram Bot API (`/sendMessage`).
-2. 🐘 **Mastodon** – Decentralized social network via ActivityPub Statuses API (OAuth Bearer).
-3. 🦋 **Bluesky** – Decentralized AT Protocol network via `com.atproto` session & record creation.
-4. 🐙 **GitHub Gist** – Code & markdown snippet platform via GitHub REST API.
-5. 📋 **Paste.ee** – Modern public paste & article publishing platform via Paste.ee REST API.
-6. 🔔 **ntfy.sh** – Open-source pub-sub notification & live web topic feed via ntfy HTTP API.
-
-The service is built with **independent fault isolation**: if any individual platform fails (due to invalid credentials, rate limits, or network timeouts), the remaining platforms continue publishing without interruption.
+1. [Features](#features)
+2. [Platforms](#platforms)
+3. [How It Works](#how-it-works)
+4. [Project Structure](#project-structure)
+5. [Setup](#setup)
+6. [Getting Platform Credentials](#getting-platform-credentials)
+7. [Running the Server](#running-the-server)
+8. [API Reference](#api-reference)
+9. [Sample Requests and Responses](#sample-requests-and-responses)
+10. [Running the Tests](#running-the-tests)
+11. [Design Decisions](#design-decisions)
+12. [Security](#security)
+13. [Known Limitations](#known-limitations)
+14. [Screenshots](#screenshots)
+15. [Live Verified Posts](#live-verified-posts)
 
 ---
 
-## 2. Architecture & Request Flow
+## Features
 
-```text
-               +--------------------------------------------------+
-               |                  Client Request                  |
-               |       POST /posting  {"message": "..."}          |
-               +--------------------------------------------------+
-                                        |
-                                        v
-               +--------------------------------------------------+
-               |              Pydantic Request Validation         |
-               |  - Non-empty, max 200 characters                 |
-               |  - Exactly one CTA link (regex r"https?://\S+")  |
-               |  - Strict URL validation via HttpUrl TypeAdapter |
-               |  - Automatic HTTP 422 on validation failure      |
-               +--------------------------------------------------+
-                                        |
-                                        v
-               +--------------------------------------------------+
-               |         posting_service.post_everywhere()        |
-               |     (asyncio.gather concurrent non-blocking)     |
-               +--------------------------------------------------+
-                    |        |         |        |        |        |
-        +-----------+        |         |        |        |        +-----------+
-        |                    |         |        |        |                    |
-        v                    v         v        v        v                    v
-  +-----------+        +----------+ +------+ +------+ +---------+        +---------+
-  | Telegram  |        | Mastodon | | Blue-| |GitHub| |Paste.ee |        | ntfy.sh |
-  | Platform  |        | Platform | | sky  | | Gist | |Platform |        | Platform|
-  +-----------+        +----------+ +------+ +------+ +---------+        +---------+
-        |                    |         |        |        |                    |
-        v                    v         v        v        v                    v
-     Telegram             Mastodon   ATProto  GitHub   Paste.ee            ntfy.sh
-      Bot API              API        xrpc      API       API                API
-        |                    |         |        |        |                    |
-        +-----------+        |         |        |        |        +-----------+
-                    |        |         |        |        |        |
-                    v        v         v        v        v        v
-               +--------------------------------------------------+
-               |     BasePlatform Exception & Timeout Shield      |
-               |   - Wraps publish() with 15s HTTP timeout        |
-               |   - Extracts status codes & response snippets    |
-               |   - Never allows exceptions to escape            |
-               +--------------------------------------------------+
-                                        |
-                                        v
-               +--------------------------------------------------+
-               |                 PostResponse                     |
-               |  - success: bool (true if >= 1 succeeded)        |
-               |  - results: list[PlatformResult]                 |
-               +--------------------------------------------------+
+- One endpoint: `POST /posting`
+- Input validation: maximum 200 characters, exactly one link, and the link must be a valid URL
+- Six platforms called concurrently with `asyncio.gather`
+- Fault isolation: one platform failing never stops the others
+- Per-platform result with status, posted URL, public access, date, time, and error
+- Credentials read from environment variables, with no secrets in the repository
+- Offline test suite where all external HTTP calls are mocked
+
+---
+
+## Platforms
+
+| # | Platform | API used | Authentication |
+|---|----------|----------|----------------|
+| 1 | Telegram | Bot API `sendMessage` | Bot token + public channel |
+| 2 | Mastodon | `POST /api/v1/statuses` | OAuth Bearer token |
+| 3 | Bluesky | AT Protocol `createSession` + `createRecord` | Handle + app password |
+| 4 | GitHub Gist | `POST /gists` (public gist) | Personal access token (`gist` scope) |
+| 5 | Paste.ee | Paste API | API key |
+| 6 | ntfy.sh | HTTP publish to a topic | Topic name |
+
+Each platform is a small class in `app/platforms/`. A platform with missing credentials returns a clear `... not configured` error instead of crashing the request.
+
+---
+
+## How It Works
+
+```
+Client
+  |  POST /posting {"message": "..."}
+  v
+Pydantic validation (schemas.py)
+  |  length <= 200, exactly one URL, valid URL
+  |  invalid input -> HTTP 422
+  v
+posting_service.post_everywhere()
+  |  asyncio.gather runs all platforms concurrently
+  v
++----------+----------+---------+--------+----------+--------+
+| Telegram | Mastodon | Bluesky |  Gist  | Paste.ee |  ntfy  |
++----------+----------+---------+--------+----------+--------+
+  |  each BasePlatform.post() catches its own exceptions
+  v
+PostResponse { success, results[] }
 ```
 
----
-
-## 3. Evaluation Criteria Mapping (100 / 100 Marks)
-
-| Criteria | Marks | Implementation in this Repository |
-|---|---:|---|
-| **FastAPI implementation and API structure** | 15 | Clean modular layout (`app/`, `platforms/`, `services/`, `schemas.py`, `config.py`), OpenAPI Swagger docs at `/docs`, health check at `/health`. |
-| **Input validation** | 15 | `PostRequest` model in `schemas.py` validates $\le$ 200 chars, exact count of 1 URL, and validates URL syntax using Pydantic's `HttpUrl`. Returns HTTP 422 with descriptive messages. |
-| **Platform research and API integration** | 25 | Integrated **6 platforms** (exceeding the 5-platform requirement) using official REST endpoints, authentication standards, and custom payload formats. |
-| **Automatic multi-platform posting** | 20 | Fully automated concurrent execution with `asyncio.gather`. Response time equals $\max(t_i)$ rather than cumulative latency. |
-| **Error handling and response management** | 10 | `BasePlatform.post()` catches all errors, extracts status code + body snippets, and returns structured `PlatformResult` without crashing. |
-| **Code quality and GitHub documentation** | 15 | Strict type hints, PEP8 compliance, async best practices, unit test suite with 10 tests, zero hardcoded secrets, and complete setup guides. |
-| **Total** | **100** | **Fully Satisfied** |
+`success` is `true` when at least one platform posted successfully.
 
 ---
 
-## 4. Project Structure
+## Project Structure
 
-```text
-automated-posting/
+```
+.
 ├── app/
+│   ├── main.py                  # FastAPI app, routes, logging
+│   ├── schemas.py               # Request/response models and validation
+│   ├── config.py                # Settings loaded from environment variables
 │   ├── platforms/
-│   │   ├── __init__.py          # Exports all 6 platform classes
-│   │   ├── base.py              # BasePlatform abstract class (exception shield & client)
-│   │   ├── bluesky.py           # Bluesky AT Protocol (session + createRecord)
-│   │   ├── gist.py              # GitHub Gists API
-│   │   ├── mastodon.py          # Mastodon Statuses API (OAuth Bearer)
-│   │   ├── ntfy.py              # ntfy.sh pub-sub web topic API
-│   │   ├── pasteee.py           # Paste.ee API
-│   │   └── telegram.py          # Telegram Bot API (sendMessage)
-│   ├── services/
-│   │   ├── __init__.py
-│   │   └── posting_service.py   # Concurrent fan-out orchestrator via asyncio.gather
-│   ├── __init__.py
-│   ├── config.py                # Environment configuration via pydantic-settings
-│   ├── main.py                  # FastAPI application with routes and logging
-│   └── schemas.py               # Request, response, and validation models
+│   │   ├── base.py              # BasePlatform: timeout, error handling, result building
+│   │   ├── telegram.py
+│   │   ├── mastodon.py
+│   │   ├── bluesky.py
+│   │   ├── gist.py
+│   │   ├── pasteee.py
+│   │   └── ntfy.py
+│   └── services/
+│       └── posting_service.py   # Runs all platforms concurrently
 ├── tests/
-│   ├── __init__.py
-│   ├── test_posting.py          # 4 mocked integration test scenarios (respx)
-│   └── test_validation.py       # 6 input validation test cases (FastAPI TestClient)
-├── .env.example                 # Example environment variables with documentation
-├── .gitignore                   # Excludes .env, caches, venv, and test artifacts
-├── README.md                    # Project documentation and evaluation guide
-└── requirements.txt             # Pinned production dependencies
+│   ├── test_validation.py       # Input validation tests
+│   └── test_posting.py          # Mocked multi-platform tests
+├── screenshots/                 # Images used in this README
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
-## 5. Setup Instructions
+## Setup
 
-### 1. Prerequisites
-* Python 3.11 or higher
-* `pip` package manager
+**Requirements:** Python 3.11 or higher
 
-### 2. Create and Activate Virtual Environment
+```bash
+# 1. Clone the repository
+git clone https://github.com/AryanSinghaniya/Automated_Posting_plateform.git
+cd Automated_Posting_plateform
 
-**On Windows (PowerShell):**
-```powershell
+# 2. Create and activate a virtual environment
 python -m venv .venv
+
+# Windows (PowerShell)
 .\.venv\Scripts\Activate.ps1
-```
-
-**On Linux/macOS:**
-```bash
-python3 -m venv .venv
+# Linux / macOS
 source .venv/bin/activate
-```
 
-### 3. Install Dependencies
-```bash
+# 3. Install dependencies
 pip install -r requirements.txt
-```
 
-### 4. Configure Environment Variables
-Copy the provided `.env.example` file to `.env`:
-```powershell
+# 4. Create your environment file
+# Windows (PowerShell)
 Copy-Item .env.example .env
-```
-*(On Linux/macOS: `cp .env.example .env`)*
-
-Configure your credentials in `.env` (the application starts cleanly even if keys are empty).
-
----
-
-## 6. Platform Credential Acquisition Guide
-
-Follow these steps to obtain credentials for each supported platform:
-
-### 1. Telegram (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHANNEL`)
-1. Open Telegram and search for [@BotFather](https://t.me/BotFather).
-2. Send `/newbot`, provide a name and username, and copy the HTTP API token into `TELEGRAM_BOT_TOKEN`.
-3. Create a public Telegram channel (e.g., `@mychannel`).
-4. Add your bot to the channel as an **Administrator** with **Post Messages** permission.
-5. Set `TELEGRAM_CHANNEL` in `.env` to your channel handle including the `@` (e.g. `@mychannel`).
-
-### 2. Mastodon (`MASTODON_BASE_URL`, `MASTODON_TOKEN`)
-1. Log in to your Mastodon instance (e.g. `https://mastodon.social`).
-2. Go to **Preferences** -> **Development** -> **New Application**.
-3. Provide an application name (e.g., `AutomatedPoster`) and select the `write:statuses` scope.
-4. Click **Submit**, then open the application to view and copy **Your access token**.
-5. Set `MASTODON_TOKEN` in `.env`. If using another instance, set `MASTODON_BASE_URL`.
-
-### 3. Bluesky (`BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD`)
-1. Log in to [bsky.app](https://bsky.app).
-2. Go to **Settings** -> **Privacy and Security** -> **App Passwords**.
-3. Click **Add App Password**, name it `FastAPI Poster`, and click **Create App Password**.
-4. Copy the 16-character generated string (e.g. `xxxx-xxxx-xxxx-xxxx`) into `BLUESKY_APP_PASSWORD`.
-5. Set `BLUESKY_HANDLE` to your full Bluesky handle (e.g., `user.bsky.social`).
-*(Note: Never use your main account password!)*
-
-### 4. GitHub Gist (`GITHUB_TOKEN`)
-1. Log in to [github.com](https://github.com).
-2. Go to **Settings** -> **Developer settings** -> **Personal access tokens** -> **Tokens (classic)**.
-3. Click **Generate new token (classic)**, name it `Gist Poster`, and check the **`gist`** scope (*Create gists*).
-4. Click **Generate token** and copy the `ghp_...` token into `GITHUB_TOKEN` in `.env`.
-
-### 5. Paste.ee (`PASTEEE_API_KEY`)
-1. Register/log in at [paste.ee](https://paste.ee).
-2. Go to **Account** -> **API** ([paste.ee/account/api](https://paste.ee/account/api)).
-3. Click **Create Application Key**.
-4. Copy your key into `PASTEEE_API_KEY` in `.env`.
-
-### 6. ntfy.sh (`NTFY_TOPIC`)
-1. Choose any unique topic name (e.g. `aryan_updates`).
-2. Set `NTFY_TOPIC=aryan_updates` in `.env`.
-3. Open `https://ntfy.sh/aryan_updates` in any web browser to see the live feed in real-time!
-
----
-
-## 7. Running the Server
-
-Start the application with Uvicorn:
-
-```powershell
-python -m uvicorn app.main:app --host 127.0.0.1 --port 4000 --reload
+# Linux / macOS
+cp .env.example .env
 ```
 
-*(Or to bind to all interfaces: `python -m uvicorn app.main:app --host 0.0.0.0 --port 4000`)*
-
-### Interactive Documentation & Endpoints:
-* **Interactive Swagger UI:** [http://localhost:4000/docs](http://localhost:4000/docs)
-* **ReDoc Documentation:** [http://localhost:4000/redoc](http://localhost:4000/redoc)
-* **Health Check:** [http://localhost:4000/health](http://localhost:4000/health)
-* **Posting API Endpoint:** `POST http://localhost:4000/posting`
+Open `.env` and add your credentials (see the next section). The app starts even if some keys are empty. Any platform without credentials reports a `not configured` error.
 
 ---
 
-## 8. Running the Test Suite
+## Getting Platform Credentials
 
-The test suite runs 100% offline using `pytest` and `respx` to mock third-party API interactions:
+| Variable | Platform |
+|----------|----------|
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHANNEL` | Telegram |
+| `MASTODON_BASE_URL`, `MASTODON_TOKEN` | Mastodon |
+| `BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD` | Bluesky |
+| `GITHUB_TOKEN` | GitHub Gist |
+| `PASTEEE_API_KEY` | Paste.ee |
+| `NTFY_TOPIC` | ntfy.sh |
 
-```powershell
-pytest -v
+### Telegram
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather).
+2. Send `/newbot`, follow the prompts, and copy the token into `TELEGRAM_BOT_TOKEN`.
+3. Create a **public** channel with a username (for example `@mychannel`).
+4. Add your bot to the channel as an **Administrator** with permission to post messages.
+5. Set `TELEGRAM_CHANNEL=@mychannel`.
+
+The posted URL has the form `https://t.me/<channel>/<message_id>`. It opens publicly only for public channels.
+
+### Mastodon
+
+1. Log in to your instance (for example `https://mastodon.social`).
+2. Go to **Preferences → Development → New application**.
+3. Select the `write:statuses` scope and submit.
+4. Copy **Your access token** into `MASTODON_TOKEN`.
+5. Set `MASTODON_BASE_URL` to your instance URL.
+
+### Bluesky
+
+1. Log in at [bsky.app](https://bsky.app).
+2. Go to **Settings → Privacy and Security → App Passwords** and create one.
+3. Set `BLUESKY_HANDLE` (for example `name.bsky.social`) and `BLUESKY_APP_PASSWORD`.
+
+Use an app password, never your main account password.
+
+### GitHub Gist
+
+1. Go to **GitHub → Settings → Developer settings → Personal access tokens**.
+2. Create a token (classic) with only the `gist` scope.
+3. Copy it into `GITHUB_TOKEN`.
+
+### Paste.ee
+
+1. Register at [paste.ee](https://paste.ee).
+2. Open your account's API page and create an application key.
+3. Copy it into `PASTEEE_API_KEY`.
+
+### ntfy.sh
+
+1. Choose a unique topic name, for example `my_unique_topic`.
+2. Set `NTFY_TOPIC=my_unique_topic`.
+3. View the feed at `https://ntfy.sh/my_unique_topic`.
+
+ntfy topics are public to anyone who knows the name, so do not use a topic name you want to keep private.
+
+---
+
+## Running the Server
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 4000
 ```
 
-### Test Coverage Breakdown:
-1. `test_validation.py`:
-   * Valid message with 1 link $\rightarrow$ Returns HTTP 200 with 6 platform results.
-   * Empty or whitespace-only message $\rightarrow$ Returns HTTP 422.
-   * Message exceeding 200 characters $\rightarrow$ Returns HTTP 422.
-   * Message with zero links $\rightarrow$ Returns HTTP 422.
-   * Message with multiple links $\rightarrow$ Returns HTTP 422.
-   * Malformed URL $\rightarrow$ Returns HTTP 422.
-2. `test_posting.py`:
-   * Scenario (a): All 6 platforms succeed $\rightarrow$ `success: true`, 6 success URLs.
-   * Scenario (b): One platform fails with 401 Unauthorized $\rightarrow$ `success: true`, failed platform captures 401 error, other 5 succeed.
-   * Scenario (c): Missing credentials $\rightarrow$ Failed status with readable error (`PASTEEE_API_KEY not configured`) without crashing.
-   * Scenario (d): All platforms fail $\rightarrow$ `success: false`, all 6 capture errors.
+Environment variables are read at startup, so restart the server after you edit `.env`.
+
+| URL | Purpose |
+|-----|---------|
+| http://localhost:4000/docs | Swagger UI |
+| http://localhost:4000/redoc | ReDoc |
+| http://localhost:4000/health | Health check |
 
 ---
 
-## 9. Sample Requests & Responses
+## API Reference
 
-### Sample Request
+### `POST /posting`
+
+**Request body**
+
+```json
+{
+  "message": "Check out our latest business platform and grow your online visibility. https://example.com"
+}
+```
+
+**Validation rules**
+
+| Rule | Failure result |
+|------|----------------|
+| Message must not be empty | 422 |
+| Message must be 200 characters or fewer | 422 |
+| Message must contain exactly one `http://` or `https://` link | 422 |
+| The link must be a valid URL | 422 |
+
+Platform selection is handled internally. The client only sends the message.
+
+**Response fields**
+
+| Field | Description |
+|-------|-------------|
+| `success` | `true` if at least one platform posted successfully |
+| `results[].platform` | Platform name |
+| `results[].status` | `success` or `failed` |
+| `results[].posted_url` | URL of the published post, or `null` on failure |
+| `results[].public_access` | Whether the post is publicly accessible |
+| `results[].date` | Posting date (`YYYY-MM-DD`, UTC) |
+| `results[].time` | Posting time (`HH:MM:SS`, UTC) |
+| `results[].error` | Error details, or `null` on success |
+
+### `GET /health`
+
+Returns `{"status": "ok"}`.
+
+---
+
+## Sample Requests and Responses
+
+### Request
+
 ```bash
 curl -X POST "http://localhost:4000/posting" \
   -H "Content-Type: application/json" \
   -d '{"message": "Check out our latest business platform and grow your online visibility. https://example.com"}'
 ```
 
-### Sample Complete Success Response (`HTTP 200 OK`)
+On Windows PowerShell, use `curl.exe` and save the JSON body to a file:
+
+```powershell
+curl.exe -X POST http://localhost:4000/posting -H "Content-Type: application/json" -d "@body.json"
+```
+
+### Success response (HTTP 200)
+
 ```json
 {
   "success": true,
@@ -282,38 +295,34 @@ curl -X POST "http://localhost:4000/posting" \
       "date": "2026-11-17",
       "time": "07:40:15",
       "error": null
-    },
-    {
-      "platform": "bluesky",
-      "status": "success",
-      "posted_url": "https://bsky.app/profile/aryansinghaniya.bsky.social/post/3n2ik2s7slv2x",
-      "public_access": true,
-      "date": "2026-11-17",
-      "time": "07:40:15",
-      "error": null
-    },
+    }
+  ]
+}
+```
+
+The full response contains one entry for each of the six platforms. Only two are shown here to keep this example short.
+
+### Partial failure response (HTTP 200)
+
+One platform fails and the others still succeed:
+
+```json
+{
+  "success": true,
+  "results": [
     {
       "platform": "gist",
-      "status": "success",
-      "posted_url": "https://gist.github.com/AryanSinghaniya/51fd7678e5eed981907b5b9281b6faf7",
-      "public_access": true,
-      "date": "2026-11-17",
-      "time": "07:40:15",
-      "error": null
+      "status": "failed",
+      "posted_url": null,
+      "public_access": false,
+      "date": null,
+      "time": null,
+      "error": "HTTP 401: Bad credentials"
     },
     {
-      "platform": "pasteee",
+      "platform": "mastodon",
       "status": "success",
-      "posted_url": "https://pastee.dev/p/QkOZrRyn",
-      "public_access": true,
-      "date": "2026-11-17",
-      "time": "07:40:15",
-      "error": null
-    },
-    {
-      "platform": "ntfy",
-      "status": "success",
-      "posted_url": "https://ntfy.sh/aryan_updates",
+      "posted_url": "https://mastodon.social/@aryansinghaniya/117630646176658188",
       "public_access": true,
       "date": "2026-11-17",
       "time": "07:40:15",
@@ -323,116 +332,105 @@ curl -X POST "http://localhost:4000/posting" \
 }
 ```
 
----
+### Validation error response (HTTP 422)
 
-## 10. Design Decisions
+Request:
 
-1. **Why `asyncio.gather`?**
-   Sequential requests would accumulate latency ($\sum_{i=1}^6 t_i \approx 3\text{--}6\text{ seconds}$). By fanning out concurrently with `asyncio.gather`, overall latency equals the single slowest request ($\max_{i=1}^6 t_i \approx 500\text{--}800\text{ ms}$).
-2. **Why the `BasePlatform` Template Pattern?**
-   Encapsulates standard lifecycle duties (timeout configuration, credential validation, UTC timestamping, and exception handling) while leaving platform subclasses strictly focused on building REST payloads. Adding a new platform requires only subclassing `BasePlatform` and adding it to `PLATFORM_CLASSES`.
-3. **Why These 6 Platforms?**
-   Demonstrates a broad spectrum of authentication architectures:
-   * Telegram Bot API token in URL path (Telegram)
-   * ActivityPub Bearer OAuth token (Mastodon)
-   * Multi-step AT Protocol session JWT and record creation (Bluesky)
-   * GitHub Fine-Grained / Classic token (GitHub Gist)
-   * Header API key token with JSON payload (Paste.ee)
-   * Open pub-sub HTTP topic broadcast (ntfy.sh)
-
----
-
-## 11. Security & Compliance
-
-* **Zero Hardcoded Secrets**: All tokens and keys are loaded dynamically via `pydantic-settings` from environment variables.
-* **Git Protection**: `.env` is explicitly ignored in `.gitignore`.
-* **Sanitized Logging**: Only public URLs and sanitized error messages are logged. Sensitive tokens, passwords, and API keys are never exposed in logs or responses.
-
----
-
-## 12. LLM Platform & Model Research (Cost, Speed, and Accuracy Analysis)
-
-To evaluate how future AI-driven copy generation or message summarization can integrate into this automated publishing pipeline, we researched and benchmarked the leading LLM platforms:
-
-### A. Provider & Model Comparison
-
-| Provider | Model Name | Input Cost (per 1M tokens) | Output Cost (per 1M tokens) | Measured Response Time | Context Window | Native JSON Support | Overall Suitability |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Google** | **Gemini 2.0 Flash / 1.5 Flash** | **$0.075** | **$0.30** | **~0.4 – 0.8s** | **1,000,000** | ✅ Structured Outputs (`response_schema`) | 🏆 **Top Recommendation** (Fastest & Lowest Cost) |
-| **OpenAI** | **GPT-4o-mini** | $0.15 | $0.60 | ~0.8 – 1.4s | 128,000 | ✅ Strict JSON Mode (`response_format`) | Excellent fallback for high-complexity prompts |
-| **Anthropic** | **Claude 3.5 Haiku** | $0.80 | $4.00 | ~0.9 – 1.6s | 200,000 | ✅ Tool Use JSON | High accuracy, but $5\times$ more expensive |
-| **Meta / Groq**| **Llama 3.3 70B (Groq LPU)** | $0.59 | $0.79 | ~0.3 – 0.5s | 128,000 | ✅ JSON Mode | Ultra-fast inference, but stricter token rate limits |
-
-### B. Best Model Selection: Google Gemini 1.5 / 2.0 Flash
-1. **Industry-Leading Cost Efficiency:** At \$0.075 / 1M input tokens, Gemini is **50% cheaper than GPT-4o-mini** and **10x cheaper than Claude 3.5 Haiku**.
-2. **Sub-second Response Speed:** Average time-to-first-token is under 500 ms, critical for low-latency API pipelines.
-3. **Native JSON Schemas:** Supports Pydantic BaseModel compilation into native API response schemas, eliminating hallucinated or malformed JSON.
-4. **Massive Context Window:** 1M token context allows ingestion of entire webpages, docs, or full brand guidelines without truncation.
-
-### C. Production Cost Optimization Strategies
-* **HTML & Markdown Pruning:** Strip boilerplate scripts, CSS, and navigation headers before sending context to LLMs, reducing input token usage by 60–80%.
-* **Structured Output Enforcement:** Use JSON Mode or function calling to ensure zero retries due to parsing errors.
-* **Semantic Caching:** Cache LLM-generated summaries or posts for identical input links using in-memory Redis or hash-based caches.
-* **Token Budget:** Set `max_tokens: 300` since published social messages are limited to $\le$ 200 characters.
-
-### D. Cost & Token Estimates per API Post
-
-| Metric | Estimated Value |
-| :--- | :--- |
-| **Estimated Input Tokens** | 450 tokens (System prompt + user context) |
-| **Estimated Output Tokens** | 80 tokens (Post message $\le$ 200 chars) |
-| **Cost per Post (Gemini Flash)** | **\$0.000057** (~17,500 posts per \$1.00) |
-| **Average Inference Time** | **~650 ms** |
-| **Fallback Recommendation** | **OpenAI GPT-4o-mini** |
-
----
-
-## 13. Live Execution Logs & Proof of Implementation
-
-### A. Uvicorn Server Startup Log
-```text
-INFO:     Started server process [21636]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:4000 (Press CTRL+C to quit)
+```json
+{ "message": "Hey this is Aryan Singhaniya !" }
 ```
 
-### B. Unit Test Execution Log (`pytest -v`)
-```text
-============================= test session starts =============================
-platform win32 -- Python 3.12.10, pytest-8.3.5, pluggy-1.6.0
-rootdir: C:\Users\hp\OneDrive\Desktop\Fast_API_APP\automated-posting
-plugins: anyio-4.14.2, langsmith-0.3.45, asyncio-1.4.0, respx-0.23.1
-collected 10 items
+Response:
 
-tests/test_posting.py::test_all_platforms_succeed PASSED                  [ 10%]
-tests/test_posting.py::test_one_platform_fails_with_401_others_succeed PASSED [ 20%]
-tests/test_posting.py::test_missing_credential_produces_failed_result PASSED [ 30%]
-tests/test_posting.py::test_all_platforms_fail_returns_success_false PASSED   [ 40%]
-tests/test_validation.py::test_valid_message PASSED                       [ 50%]
-tests/test_validation.py::test_empty_message PASSED                       [ 60%]
-tests/test_validation.py::test_over_200_characters PASSED                [ 70%]
-tests/test_validation.py::test_no_link PASSED                             [ 80%]
-tests/test_validation.py::test_two_links PASSED                           [ 90%]
-tests/test_validation.py::test_malformed_url PASSED                       [100%]
-
-============================= 10 passed in 5.46s ==============================
+```json
+{
+  "detail": [
+    {
+      "type": "value_error",
+      "loc": ["body", "message"],
+      "msg": "Value error, Message must contain exactly one link (found 0).",
+      "input": "Hey this is Aryan Singhaniya !"
+    }
+  ]
+}
 ```
-
-### C. Live Verified Public Post Links
-* ✈️ **Telegram:** [https://t.me/aryan_update/13](https://t.me/aryan_update/13)
-* 🐘 **Mastodon:** [https://mastodon.social/@aryansinghaniya/117630646176658188](https://mastodon.social/@aryansinghaniya/117630646176658188)
-* 🦋 **Bluesky:** [https://bsky.app/profile/aryansinghaniya.bsky.social/post/3n2ik2s7slv2x](https://bsky.app/profile/aryansinghaniya.bsky.social/post/3n2ik2s7slv2x)
-* 🐙 **GitHub Gist:** [https://gist.github.com/AryanSinghaniya/51fd7678e5eed981907b5b9281b6faf7](https://gist.github.com/AryanSinghaniya/51fd7678e5eed981907b5b9281b6faf7)
-* 📋 **Paste.ee:** [https://pastee.dev/p/QkOZrRyn](https://pastee.dev/p/QkOZrRyn)
-* 🔔 **ntfy.sh:** [https://ntfy.sh/aryan_updates](https://ntfy.sh/aryan_updates)
 
 ---
 
-## 14. Screenshots Placeholder
+## Running the Tests
 
-*(Place screenshots here of the Swagger UI documentation, successful POST execution, and terminal logs)*
+```bash
+pytest -v
+```
 
-<!-- SCREENSHOT_PLACEHOLDER_START -->
-*Screenshots will be placed here.*
-<!-- SCREENSHOT_PLACEHOLDER_END -->
+The tests run fully offline. All third-party HTTP calls are mocked with `respx`.
+
+| File | What it covers |
+|------|----------------|
+| `tests/test_validation.py` | Valid message, empty message, over 200 characters, no link, two links, malformed URL |
+| `tests/test_posting.py` | All platforms succeed, one platform returns 401 while the others succeed, missing credentials, all platforms fail |
+
+---
+
+## Design Decisions
+
+**Concurrency with `asyncio.gather`.** The six calls are independent network requests, so running them concurrently makes the total time close to the slowest single request instead of the sum of all six.
+
+**A `BasePlatform` base class.** It holds the shared behavior: HTTP timeout, credential checks, error formatting, and building the result object. Each platform subclass only builds its own request. To add a platform, create one class and add it to `PLATFORM_CLASSES` in `posting_service.py`.
+
+**Fault isolation.** `BasePlatform.post()` wraps `publish()` in a try/except, so every failure becomes a `failed` result for that platform. No exception can reach the other platforms or crash the request.
+
+**Platform choice.** I chose platforms that offer a free API with a simple token and no approval process. Larger networks such as X, LinkedIn, and Medium require paid tiers, app review, or have closed their public posting APIs. The six chosen platforms also cover different authentication styles: a token in the URL path (Telegram), an OAuth bearer token (Mastodon), a two-step session flow (Bluesky), a personal access token (Gist), an API-key header (Paste.ee), and an open topic (ntfy.sh).
+
+**Validation in Pydantic.** The rules live in a field validator on `PostRequest`. FastAPI turns a failure into a 422 response automatically. The URL is extracted with a regex and then checked with Pydantic's `HttpUrl`.
+
+---
+
+## Security
+
+- No credentials are stored in the code. All keys come from environment variables through `pydantic-settings`.
+- `.env` is listed in `.gitignore`. Only `.env.example`, which holds placeholder values, is committed.
+- Logs record the platform, status, URL, and error text only. They never include tokens or passwords.
+- Bluesky uses an app password, not the account password.
+
+---
+
+## Known Limitations
+
+- Telegram post URLs open publicly only when the channel is public and has a username.
+- ntfy.sh topics are readable by anyone who knows the topic name.
+- Timestamps are in UTC.
+- Free API tiers can apply rate limits or spam filters, so repeated test posts of the same message may be rejected by some platforms.
+- The service does not retry failed platforms. A failed platform is reported in the response and left to the caller.
+
+---
+
+## Screenshots
+
+### Swagger UI
+![Swagger UI](screenshots/swagger-ui.png)
+
+### Successful posting response
+![Successful response](screenshots/success-response.png)
+
+### Validation error (HTTP 422)
+![Validation error](screenshots/validation-error.png)
+
+### Partial failure (one platform fails, others succeed)
+![Partial failure](screenshots/partial-failure.png)
+
+### Test results
+![Tests passing](screenshots/pytest.png)
+
+---
+
+## Live Verified Posts
+
+These posts were created by running the service against the real platform APIs:
+
+- Telegram: https://t.me/aryan_update/13
+- Mastodon: https://mastodon.social/@aryansinghaniya/117630646176658188
+- Bluesky: https://bsky.app/profile/aryansinghaniya.bsky.social/post/3n2ik2s7slv2x
+- GitHub Gist: https://gist.github.com/AryanSinghaniya/51fd7678e5eed981907b5b9281b6faf7
+- Paste: https://pastee.dev/p/QkOZrRyn
+- ntfy.sh: https://ntfy.sh/aryan_updates
